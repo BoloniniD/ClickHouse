@@ -13,6 +13,7 @@
 #include <Parsers/ASTTTLElement.h>
 #include <Storages/extractKeyExpressionList.h>
 #include <Parsers/ASTIdentifier.h>
+#include <Parsers/ASTLiteral.h>
 #include <Parsers/ASTAssignment.h>
 #include <Storages/ColumnsDescription.h>
 #include <Interpreters/Context.h>
@@ -21,6 +22,9 @@
 #include <DataTypes/DataTypeDate32.h>
 #include <DataTypes/DataTypeDateTime.h>
 #include <DataTypes/DataTypeDateTime64.h>
+#include <DataTypes/DataTypeNullable.h>
+#include <DataTypes/DataTypeLowCardinality.h>
+#include <Common/logger_useful.h>
 #include <Interpreters/FunctionNameNormalizer.h>
 #include <Parsers/ExpressionListParsers.h>
 #include <Parsers/parseQuery.h>
@@ -119,6 +123,32 @@ public:
 using FindAggregateFunctionFinderMatcher = OneTypeMatcher<FindAggregateFunctionData>;
 using FindAggregateFunctionVisitor = InDepthNodeVisitor<FindAggregateFunctionFinderMatcher, true>;
 
+/// Replaces bare column references for Date/DateTime columns with CAST(col, 'WidenedType')
+/// so that overflow-check expressions accept the original narrow column types at runtime
+/// while internally performing arithmetic in a wider type (Date32 / DateTime64).
+struct InjectWidenCastData
+{
+    using TypeToVisit = ASTIdentifier;
+    const std::unordered_map<String, String> & cast_targets;
+
+    void visit(ASTIdentifier & ident, ASTPtr & node) const
+    {
+        auto it = cast_targets.find(ident.name());
+        if (it == cast_targets.end())
+            it = cast_targets.find(ident.shortName());
+        if (it != cast_targets.end())
+        {
+            ASTs args;
+            args.push_back(node);
+            args.push_back(new ASTLiteral(it->second));
+            node = makeASTFunction("CAST", std::move(args));
+        }
+    }
+};
+using InjectWidenCastMatcher = OneTypeMatcher<InjectWidenCastData>;
+/// Bottom-up traversal (false) prevents re-visiting the injected CAST node's children.
+using InjectWidenCastVisitor = InDepthNodeVisitor<InjectWidenCastMatcher, false>;
+
 }
 
 TTLDescription::TTLDescription(const TTLDescription & other)
@@ -175,9 +205,84 @@ TTLDescription & TTLDescription::operator=(const TTLDescription & other)
     return * this;
 }
 
+/// Builds an expression that evaluates the TTL expression with `Date`/`DateTime` column
+/// references replaced by `CAST(col, 'Date32')` / `CAST(col, 'DateTime64(0, tz)')`.
+/// The resulting expression accepts the original narrow column types at runtime (no type
+/// mismatch) but performs arithmetic in the wider types, which do not silently wrap.
+/// Returns nullptr when no Date/DateTime columns are present (nothing can overflow).
+static ExpressionActionsPtr buildOverflowCheckExpression(
+    const ASTPtr & original_ast, const NamesAndTypesList & columns, const ContextPtr & context)
+{
+    /// Map column name -> CAST target type string (e.g. "Date32", "DateTime64(0, 'UTC')").
+    std::unordered_map<String, String> cast_targets;
+    for (const auto & col : columns)
+    {
+        /// Strip LowCardinality first, then Nullable: the reverse order misses
+        /// `LowCardinality(Nullable(Date))` because `removeNullable` only touches
+        /// top-level Nullable.
+        const auto inner = removeLowCardinalityAndNullable(col.type);
+        if (isDate(inner))
+        {
+            cast_targets[col.name] = "Date32";
+        }
+        else if (isDateTime(inner))
+        {
+            /// Preserve the original timezone so calendar-based arithmetic (addMonths,
+            /// addYears) and DST boundaries produce identical results in both evaluations,
+            /// avoiding false-positive overflow detections.
+            const auto & dt = typeid_cast<const DataTypeDateTime &>(*inner);
+            const String & tz = dt.getTimeZone().getTimeZone();
+            cast_targets[col.name] = tz.empty() ? "DateTime64(0)" : "DateTime64(0, '" + tz + "')";
+        }
+    }
+
+    if (cast_targets.empty())
+        return nullptr;
+
+    /// Capture the result column name before any AST mutation.
+    auto result_column_name = original_ast->formatWithSecretsOneLine();
+
+    /// Clone so the caller's AST is not affected, then inject CAST nodes.
+    auto ast = original_ast->clone();
+
+    try
+    {
+        InjectWidenCastData inject_data{cast_targets};
+        InjectWidenCastVisitor(inject_data).visit(ast);
+
+        /// Build with the *original* column types - the CAST nodes inside the expression
+        /// handle the widening at evaluation time, so no type mismatch at runtime.
+        auto syntax_analyzer_result = TreeRewriter(context).analyze(ast, columns);
+        ExpressionAnalyzer analyzer(ast, syntax_analyzer_result, context);
+        auto dag = analyzer.getActionsDAG(false);
+
+        const auto * col = &dag.findInOutputs(ast->getColumnName());
+        if (col->result_name != result_column_name)
+            col = &dag.addAlias(*col, result_column_name);
+
+        dag.getOutputs() = {col};
+        dag.removeUnusedActions();
+
+        return std::make_shared<ExpressionActions>(std::move(dag), ExpressionActionsSettings(context));
+    }
+    catch (...)
+    {
+        throw Exception(ErrorCodes::BAD_TTL_EXPRESSION,
+            "Failed to build overflow-check expression for TTL; "
+            "the TTL uses Date or DateTime columns whose widened counterparts (Date32 / DateTime64) "
+            "are not supported by one of the functions in the expression. "
+            "Original error: {}",
+            getCurrentExceptionMessage(/*with_stacktrace=*/false));
+    }
+}
+
 static ExpressionAndSets buildExpressionAndSets(ASTPtr & ast, const NamesAndTypesList & columns, const ContextPtr & context)
 {
     ExpressionAndSets result;
+    /// Build the overflow-check expression from the unmutated AST before TreeRewriter
+    /// rewrites `ast` in place below.
+    result.overflow_check_expression = buildOverflowCheckExpression(ast, columns, context);
+
     auto ttl_string = ast->formatWithSecretsOneLine();
     auto syntax_analyzer_result = TreeRewriter(context).analyze(ast, columns);
     ExpressionAnalyzer analyzer(ast, syntax_analyzer_result, context);
