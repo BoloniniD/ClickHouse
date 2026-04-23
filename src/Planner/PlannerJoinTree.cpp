@@ -208,7 +208,10 @@ NameSet checkAccessRights(const TableNode & table_node, const Names & column_nam
         for (const auto & name : column_names)
         {
             auto storage_column = Nested::tryGetColumnNameInStorage(name, storage_columns_set);
-            normalized_column_names.push_back(storage_column ? std::move(*storage_column) : name);
+            if (storage_column)
+                normalized_column_names.push_back(std::move(*storage_column));
+            else
+                normalized_column_names.push_back(name);
         }
 
         query_context->checkAccess(AccessType::SELECT, storage_id, normalized_column_names);

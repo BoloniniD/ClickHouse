@@ -444,7 +444,10 @@ void checkAccessRightsForSelect(
         for (const auto & name : required_columns)
         {
             auto storage_column = Nested::tryGetColumnNameInStorage(name, storage_columns_set);
-            normalized_columns.push_back(storage_column ? std::move(*storage_column) : name);
+            if (storage_column)
+                normalized_columns.push_back(std::move(*storage_column));
+            else
+                normalized_columns.push_back(name);
         }
 
         context->checkAccess(AccessType::SELECT, table_id, normalized_columns);
